@@ -1,0 +1,145 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from xgboost import XGBClassifier
+import plotly.graph_objects as go
+from sklearn.metrics import accuracy_score
+from datetime import datetime, timedelta
+
+st.set_page_config(page_title="AI Quant Terminal Pro", layout="wide")
+
+st.sidebar.title("⚙️ Settings")
+ticker = st.sidebar.text_input("Ticker", "AAPL").upper()
+days_back = st.sidebar.slider("Training Days", 60, 365, 180)
+threshold = st.sidebar.slider("Buy Probability", 0.5, 0.9, 0.6)
+
+@st.cache_data
+def load_data(symbol, days):
+    end = datetime.now()
+    start = end - timedelta(days=days)
+    df = yf.download(symbol, start=start, end=end, interval="1h")
+    return df
+
+df = load_data(ticker, days_back)
+
+if df.empty:
+    st.error("No data found")
+    st.stop()
+
+def add_indicators(data):
+    df = data.copy()
+
+    df["Returns"] = df["Close"].pct_change()
+
+    df["SMA20"] = df["Close"].shift(1).rolling(20).mean()
+    df["SMA50"] = df["Close"].shift(1).rolling(50).mean()
+
+    df["Volatility"] = df["Returns"].shift(1).rolling(20).std()
+
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    rs = gain / loss
+    df["RSI"] = (100 - (100 / (1 + rs))).shift(1)
+
+    df["Momentum"] = df["Close"].shift(1) - df["Close"].shift(5)
+
+    df["Target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
+
+    return df.dropna()
+
+df_feat = add_indicators(df)
+
+
+features = ["Close", "SMA20", "SMA50", "Volatility", "RSI", "Momentum"]
+
+X = df_feat[features]
+y = df_feat["Target"]
+
+split = int(len(X) * 0.8)
+
+X_train = X.iloc[:split]
+X_test = X.iloc[split:]
+
+y_train = y.iloc[:split]
+y_test = y.iloc[split:]
+
+model = XGBClassifier(
+    n_estimators=200,
+    learning_rate=0.03,
+    max_depth=6,
+    subsample=0.9,
+    colsample_bytree=0.9
+)
+
+model.fit(X_train, y_train)
+
+pred_test = model.predict(X_test)
+acc = accuracy_score(y_test, pred_test)
+
+latest_prob = model.predict_proba(X.iloc[-1:])[0][1]
+signal = "BUY" if latest_prob > threshold else "SELL"
+
+st.title(f"📈 AI Quant Terminal PRO — {ticker}")
+
+c1, c2, c3, c4 = st.columns(4)
+
+c1.metric("Price", f"${float(df['Close'].iloc[-1]):.2f}")
+c2.metric("Signal", signal)
+c3.metric("AI Confidence", f"{latest_prob*100:.2f}%")
+c4.metric("Model Accuracy", f"{acc*100:.2f}%")
+
+fig = go.Figure()
+
+fig.add_trace(go.Candlestick(
+    x=df.index,
+    open=df["Open"],
+    high=df["High"],
+    low=df["Low"],
+    close=df["Close"],
+    name="Price"
+))
+
+fig.add_trace(go.Scatter(
+    x=df_feat.index,
+    y=df_feat["SMA20"],
+    line=dict(color="orange"),
+    name="SMA20"
+))
+
+buy_signals = X_test[pred_test == 1]
+sell_signals = X_test[pred_test == 0]
+
+fig.add_trace(go.Scatter(
+    x=buy_signals.index,
+    y=df.loc[buy_signals.index]["Close"],
+    mode="markers",
+    marker=dict(color="green", size=8),
+    name="Buy"
+))
+
+fig.add_trace(go.Scatter(
+    x=sell_signals.index,
+    y=df.loc[sell_signals.index]["Close"],
+    mode="markers",
+    marker=dict(color="red", size=8),
+    name="Sell"
+))
+
+fig.update_layout(template="plotly_dark", height=600)
+st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("📊 Strategy Backtest")
+
+returns = df_feat["Returns"].iloc[split:]
+
+strategy = returns * pred_test
+
+cum_strategy = (1 + strategy).cumprod()
+cum_market = (1 + returns).cumprod()
+
+b1, b2 = st.columns(2)
+
+b1.metric("AI Strategy Return", f"{(cum_strategy.iloc[-1]-1)*100:.2f}%")
+b2.metric("Buy & Hold Return", f"{(cum_market.iloc[-1]-1)*100:.2f}%")
